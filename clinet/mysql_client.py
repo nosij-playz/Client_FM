@@ -5,7 +5,6 @@ from typing import Optional
 
 import mysql.connector
 from mysql.connector import Error as MySQLError
-from mysql.connector.pooling import MySQLConnectionPool
 
 
 @dataclass(frozen=True)
@@ -34,20 +33,11 @@ class AlertRow:
 
 
 class MySQLRadioDB:
-    def __init__(self, config: MySQLConfig, *, pool_size: int = 3):
+    def __init__(self, config: MySQLConfig):
         self.config = config
 
-        # Pooling significantly reduces overhead on low-power devices and on
-        # higher-latency networks. Each call gets its own connection from the pool.
-        size = int(pool_size)
-        if size < 1:
-            size = 1
-        if size > 10:
-            size = 10
-        self._pool = MySQLConnectionPool(
-            pool_name="clinet_pool",
-            pool_size=size,
-            pool_reset_session=True,
+    def _conn(self):
+        return mysql.connector.connect(
             host=self.config.host,
             port=self.config.port,
             user=self.config.user,
@@ -56,25 +46,7 @@ class MySQLRadioDB:
             connection_timeout=self.config.connection_timeout,
             use_unicode=True,
             charset="utf8mb4",
-            autocommit=True,
         )
-
-    def _conn(self):
-        try:
-            return self._pool.get_connection()
-        except Exception:
-            # Fallback in case pooling isn't available or fails.
-            return mysql.connector.connect(
-                host=self.config.host,
-                port=self.config.port,
-                user=self.config.user,
-                password=self.config.password,
-                database=self.config.database,
-                connection_timeout=self.config.connection_timeout,
-                use_unicode=True,
-                charset="utf8mb4",
-                autocommit=True,
-            )
 
     def get_next_music_after(self, last_id: int) -> Optional[MusicRow]:
         conn = self._conn()

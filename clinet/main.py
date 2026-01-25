@@ -7,7 +7,8 @@ import time
 
 from .mysql_client import MySQLConfig, MySQLRadioDB
 from .state import load_state, save_state
-from .ytdlp_player import StreamPlayer
+from .tts import detect_language, generate_voice_from_text
+from .ytdlp_player import StreamPlayer, get_media_duration_seconds
 
 
 class FMClient:
@@ -19,16 +20,11 @@ class FMClient:
         mysql_password,
         mysql_database,
         mysql_timeout=10,
-        mysql_pool_size: int = 3,
         state_path="client_state.json",
         poll_interval=3,
         default_duration=180,
         music_id: int = 1,
         music_watch_interval: float = 1.0,
-        status_watch_interval: float = 2.0,
-        alert_check_interval: float = 1.5,
-        enable_tts: bool = True,
-        enable_duration_detect: bool = True,
     ):
         self.cfg = MySQLConfig(
             host=mysql_host,
@@ -39,7 +35,7 @@ class FMClient:
             connection_timeout=mysql_timeout,
         )
 
-        self.db = MySQLRadioDB(self.cfg, pool_size=int(mysql_pool_size))
+        self.db = MySQLRadioDB(self.cfg)
         self.player = StreamPlayer()
 
         self.state_path = state_path
@@ -52,14 +48,6 @@ class FMClient:
         # enable this mode by setting music_id=1 (default).
         self.music_id = int(music_id)
         self.music_watch_interval = float(music_watch_interval)
-
-        self.status_watch_interval = float(status_watch_interval)
-        self.alert_check_interval = float(alert_check_interval)
-        if self.alert_check_interval < 0.2:
-            self.alert_check_interval = 0.2
-
-        self.enable_tts = bool(enable_tts)
-        self.enable_duration_detect = bool(enable_duration_detect)
 
         self._music_lock = threading.Lock()
         self._desired_music = None
@@ -236,8 +224,6 @@ class FMClient:
         )
 
     def speak_message(self, msg: str, *, gain: float = 1.0) -> int:
-        if not self.enable_tts:
-            return 0
         if not self.is_audio_allowed():
             self._print_status_mode_once()
             return 0
@@ -251,17 +237,9 @@ class FMClient:
 
             if self.debug_tts:
                 p = str(part)
-                try:
-                    from .tts import detect_language
-
-                    lang_dbg = detect_language(p)
-                except Exception:
-                    lang_dbg = "?"
-                print(f"🧪 TTS part len={len(p)} lang={lang_dbg} repr={p!r}")
+                print(f"🧪 TTS part len={len(p)} lang={detect_language(p)} repr={p!r}")
 
             try:
-                from .tts import detect_language, generate_voice_from_text
-
                 lang = detect_language(part)
                 audio = generate_voice_from_text(part, lang=lang)
             except Exception as e:
@@ -281,12 +259,6 @@ class FMClient:
                 from playsound import playsound
 
                 playsound(audio["file"])
-            finally:
-                # Clean up temp mp3 to avoid filling small SD cards.
-                try:
-                    os.remove(audio["file"])
-                except Exception:
-                    pass
             spoken += 1
 
         return spoken
@@ -456,15 +428,8 @@ class FMClient:
     def play_music(self, music):
         def _resolve_duration(m):
             d = m.duration_seconds
-            # Duration detection via yt-dlp is expensive; avoid it in fixed-row mode
-            # and allow disabling it entirely for low-power devices.
-            if d is None and self.enable_duration_detect and self.music_id <= 0:
-                try:
-                    from .ytdlp_player import get_media_duration_seconds
-
-                    d = get_media_duration_seconds(m.link)
-                except Exception:
-                    d = None
+            if d is None:
+                d = get_media_duration_seconds(m.link)
             if d is None and self.music_id <= 0:
                 d = int(self.default_duration)
             return d
@@ -479,8 +444,6 @@ class FMClient:
 
         started_at = time.time()
         planned = int(duration) if duration is not None else None
-
-        last_alert_check = 0.0
 
         while True:
             if not self.is_audio_allowed():
@@ -510,72 +473,61 @@ class FMClient:
                 self.player.stop()
                 break
 
-            now = time.time()
-            if (now - float(last_alert_check)) >= float(self.alert_check_interval):
-                last_alert_check = now
+            # Interrupt for user alerts
+            user_alert = self.db.get_next_user_alert_after(
+                self.state.last_user_alert_id
+            )
+            if user_alert and user_alert.id > 0:
+                print(f"📥 User alert (id={user_alert.id})")
+                self.player.stop()
 
-                # Interrupt for user alerts
-                user_alert = self.db.get_next_user_alert_after(self.state.last_user_alert_id)
-                if user_alert and user_alert.id > 0:
-                    print(f"📥 User alert (id={user_alert.id})")
-                    self.player.stop()
+                try:
+                    self.speak_message(user_alert.message, gain=self.tts_gain_user)
+                except Exception as e:
+                    print(f"❌ Failed to speak user alert: {e}")
+                else:
+                    removed = self.db.ack_user_alert(user_alert.id)
+                    if not removed:
+                        print(f"⚠️  Could not remove user alert from DB (id={user_alert.id})")
+                    self.state.last_user_alert_id = max(
+                        self.state.last_user_alert_id, user_alert.id
+                    )
+                    save_state(self.state_path, self.state)
 
-                    try:
-                        self.speak_message(user_alert.message, gain=self.tts_gain_user)
-                    except Exception as e:
-                        print(f"❌ Failed to speak user alert: {e}")
-                    else:
-                        removed = self.db.ack_user_alert(user_alert.id)
-                        if not removed:
-                            print(f"⚠️  Could not remove user alert from DB (id={user_alert.id})")
-                        self.state.last_user_alert_id = max(
-                            self.state.last_user_alert_id, user_alert.id
-                        )
-                        save_state(self.state_path, self.state)
+                # Restart music
+                self.player.start(music.link, volume=self.music_volume_normal)
+                started_at = time.time()
 
-                    # Restart music
-                    self.player.start(music.link, volume=self.music_volume_normal)
-                    started_at = time.time()
-                    continue
+            # Duck music for AI alerts (do not pause)
+            ai_alert = self.db.get_next_ai_alert_after(self.state.last_ai_alert_id)
+            if ai_alert and ai_alert.id > 0:
+                print(f"🚨 AI alert (id={ai_alert.id}, severity={ai_alert.severity})")
 
-                # Duck music for AI alerts (do not pause)
-                ai_alert = self.db.get_next_ai_alert_after(self.state.last_ai_alert_id)
-                if ai_alert and ai_alert.id > 0:
-                    print(f"🚨 AI alert (id={ai_alert.id}, severity={ai_alert.severity})")
-
-                    # Reduce volume (best-effort: restart player with same resolved URL)
-                    try:
-                        self.player.restart_with_volume(self.music_volume_ducked)
-                    except Exception:
-                        # Fallback: restart normally (may re-resolve)
-                        self.player.start(music.link, volume=self.music_volume_ducked)
-
-                    try:
-                        spoken = self.speak_message(ai_alert.message, gain=self.tts_gain_ai)
-                        if spoken <= 0:
-                            raise ValueError("AI alert has no speakable text")
-                    except Exception as e:
-                        print(f"❌ Failed to speak AI alert: {e}")
-                        if (not self._has_speakable_text(ai_alert.message)) or self._should_ack_failed_tts(e):
-                            removed = self.db.ack_ai_alert(ai_alert.id)
-                            if not removed:
-                                print(f"⚠️  Could not remove AI alert from DB (id={ai_alert.id})")
-                            self.state.last_ai_alert_id = ai_alert.id
-                            save_state(self.state_path, self.state)
-                    else:
+                # Reduce volume (best-effort: restart ffplay with lower volume)
+                self.player.start(music.link, volume=self.music_volume_ducked)
+                try:
+                    spoken = self.speak_message(ai_alert.message, gain=self.tts_gain_ai)
+                    if spoken <= 0:
+                        raise ValueError("AI alert has no speakable text")
+                except Exception as e:
+                    print(f"❌ Failed to speak AI alert: {e}")
+                    if (not self._has_speakable_text(ai_alert.message)) or self._should_ack_failed_tts(e):
                         removed = self.db.ack_ai_alert(ai_alert.id)
                         if not removed:
                             print(f"⚠️  Could not remove AI alert from DB (id={ai_alert.id})")
                         self.state.last_ai_alert_id = ai_alert.id
                         save_state(self.state_path, self.state)
-                    finally:
-                        # Restore normal music volume (best-effort)
-                        try:
-                            self.player.restart_with_volume(self.music_volume_normal)
-                        except Exception:
-                            self.player.start(music.link, volume=self.music_volume_normal)
+                else:
+                    removed = self.db.ack_ai_alert(ai_alert.id)
+                    if not removed:
+                        print(f"⚠️  Could not remove AI alert from DB (id={ai_alert.id})")
+                    self.state.last_ai_alert_id = ai_alert.id
+                    save_state(self.state_path, self.state)
+                finally:
+                    # Restore normal music volume (best-effort)
+                    self.player.start(music.link, volume=self.music_volume_normal)
 
-            time.sleep(0.25)
+            time.sleep(0.5)
 
         self.state.last_music_id = music.id
         self.state.last_music_link = music.link
@@ -588,7 +540,7 @@ class FMClient:
         print("🛰️ Client connected (polling MySQL)")
         try:
             self.start_music_watcher()
-            self.start_status_watcher(interval=float(self.status_watch_interval))
+            self.start_status_watcher()
             while True:
                 if not self.is_audio_allowed():
                     self._print_status_mode_once()

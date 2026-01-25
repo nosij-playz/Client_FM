@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import time
 from typing import Dict
+
+from gtts import gTTS
 
 
 def detect_language(text: str) -> str:
@@ -27,16 +30,6 @@ def generate_voice_from_text(text: str, *, lang: str) -> Dict[str, str]:
         os.close(fd)
     except Exception:
         pass
-
-    # Import lazily: gTTS is relatively heavy and should not be a startup dependency
-    # when running on low-resource devices (e.g. Raspberry Pi 2) unless TTS is used.
-    try:
-        from gtts import gTTS  # type: ignore
-    except Exception as e:
-        raise RuntimeError(
-            "TTS is not available because gTTS is not installed. "
-            "Install it (pip install gTTS) or disable TTS."
-        ) from e
 
     # Malayalam sometimes works more reliably with an India TLD.
     tld = "co.in" if lang == "ml" else "com"
