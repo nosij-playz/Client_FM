@@ -1,0 +1,7 @@
+mysql-connector-python
+requests
+yt-dlp
+gTTS
+# playsound 1.3.0 frequently fails to build on newer Python versions on Windows.
+# 1.2.2 is a stable pure-Python release with the same API (from playsound import playsound).
+playsound==1.2.2

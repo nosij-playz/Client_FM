@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+
+# Local state / runtime artifacts
+client_state.json
+clinet/client_state.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
