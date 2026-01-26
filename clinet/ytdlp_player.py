@@ -5,17 +5,29 @@ import os
 import platform
 import subprocess
 import sys
-import tempfile
 import time
 from typing import Optional
 
 
 class StreamPlayer:
-    """Standalone player: resolves URL using yt-dlp then plays via ffplay/mpg123."""
+    """Optimized cross-platform stream player (Windows / Linux / Raspberry Pi)."""
 
     def __init__(self):
         self.system = platform.system().lower()
         self.player_process: Optional[subprocess.Popen] = None
+        self._cache = {}
+        self.is_pi = self._is_raspberry_pi()
+
+    # -------------------- Platform Detection --------------------
+
+    def _is_raspberry_pi(self) -> bool:
+        try:
+            with open("/proc/device-tree/model") as f:
+                return "raspberry pi" in f.read().lower()
+        except Exception:
+            return False
+
+    # -------------------- Process Handling --------------------
 
     def _kill_process_tree(self, process: Optional[subprocess.Popen]):
         if not process or process.poll() is not None:
@@ -31,7 +43,9 @@ class StreamPlayer:
                 )
             else:
                 try:
-                    os.killpg(os.getpgid(process.pid), 15)
+                    os.killpg(os.getpgid(process.pid), 15)  # SIGTERM
+                    time.sleep(0.2)
+                    os.killpg(os.getpgid(process.pid), 9)   # SIGKILL fallback
                 except Exception:
                     process.terminate()
         except Exception:
@@ -44,71 +58,74 @@ class StreamPlayer:
         self._kill_process_tree(self.player_process)
         self.player_process = None
 
-    @staticmethod
-    def _python_for_ytdlp() -> str:
-        # Use current interpreter; on the standalone device this venv should include yt-dlp.
-        return sys.executable
+    # -------------------- yt-dlp Resolution --------------------
 
     def _resolve_audio_url(self, url: str) -> str:
-        py = self._python_for_ytdlp()
-        cmd = [py, "-m", "yt_dlp", "-g", "-f", "bestaudio", "--no-playlist", url]
+        if url in self._cache:
+            return self._cache[url]
+
+        if self.system == "windows":
+            cmd = [sys.executable, "-m", "yt_dlp", "-g", "-f", "bestaudio", "--no-playlist", url]
+        else:
+            cmd = ["yt-dlp", "-g", "-f", "bestaudio", "--no-playlist", url]
+
         resolved = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
         if resolved.returncode != 0:
             details = (resolved.stderr or resolved.stdout or "").strip()
-            msg = "yt-dlp failed to resolve audio URL"
-            if details:
-                msg += f"\n\nDetails:\n{details}"
-            raise RuntimeError(msg)
+            raise RuntimeError(f"yt-dlp failed:\n{details}")
 
         lines = (resolved.stdout or "").strip().splitlines()
         if not lines:
             raise RuntimeError("yt-dlp returned no stream URL")
-        return lines[-1].strip()
+
+        stream = lines[-1].strip()
+        self._cache[url] = stream
+        return stream
+
+    # -------------------- Player Control --------------------
 
     def is_playing(self) -> bool:
         return bool(self.player_process and self.player_process.poll() is None)
 
     def start(self, url: str, *, volume: int = 100) -> None:
-        """Start playback and return immediately (non-blocking).
-
-        On Windows, uses ffplay's `-volume` (0-100).
-        """
+        """Start playback (non-blocking)."""
         self.stop()
-
         stream_url = self._resolve_audio_url(url)
 
-        if self.system == "windows":
-            vol = int(volume)
-            if vol < 0:
-                vol = 0
-            if vol > 100:
-                vol = 100
-            player_cmd = [
-                "ffplay",
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "error",
-                "-volume",
-                str(vol),
-                stream_url,
-            ]
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-            preexec_fn = None
-        else:
-            player_cmd = ["mpg123", stream_url]
-            creationflags = 0
-            preexec_fn = os.setsid
+        vol = max(0, min(100, int(volume)))
 
-        self.player_process = subprocess.Popen(
-            player_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-            preexec_fn=preexec_fn,
-        )
+        player_cmd = [
+            "ffplay",
+            "-vn",               # disable video
+            "-nodisp",
+            "-autoexit",
+            "-loglevel", "error",
+        ]
+
+        # Force ALSA on Raspberry Pi
+        if self.is_pi:
+            player_cmd += ["-f", "alsa", "-ac", "2"]
+
+        player_cmd += ["-volume", str(vol), stream_url]
+
+        if self.system == "windows":
+            self.player_process = subprocess.Popen(
+                player_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            self.player_process = subprocess.Popen(
+                player_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
 
     def play(self, url: str, *, duration: Optional[int] = None):
+        """Blocking play."""
         self.start(url)
 
         if duration is not None:
@@ -120,13 +137,19 @@ class StreamPlayer:
         self.player_process = None
 
 
+# -------------------- Duration Utility --------------------
+
 def get_media_duration_seconds(url: str, *, timeout: int = 45) -> Optional[int]:
     """Return media duration in seconds using yt-dlp JSON, or None if unknown/live."""
 
     if not url:
         return None
 
-    cmd = [sys.executable, "-m", "yt_dlp", "-J", "--no-playlist", url]
+    if platform.system().lower() == "windows":
+        cmd = [sys.executable, "-m", "yt_dlp", "-J", "--no-playlist", url]
+    else:
+        cmd = ["yt-dlp", "-J", "--no-playlist", url]
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
     except Exception:
