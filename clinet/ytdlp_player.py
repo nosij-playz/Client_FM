@@ -2,30 +2,17 @@ from __future__ import annotations
 
 import json
 import os
-import platform
 import subprocess
-import sys
 import time
 from typing import Optional
 
 
 class StreamPlayer:
-    """Optimized cross-platform stream player (Windows / Linux / Raspberry Pi)."""
+    """Optimized Linux-only stream player using yt-dlp + ffplay."""
 
     def __init__(self):
-        self.system = platform.system().lower()
         self.player_process: Optional[subprocess.Popen] = None
-        self._cache = {}
-        self.is_pi = self._is_raspberry_pi()
-
-    # -------------------- Platform Detection --------------------
-
-    def _is_raspberry_pi(self) -> bool:
-        try:
-            with open("/proc/device-tree/model") as f:
-                return "raspberry pi" in f.read().lower()
-        except Exception:
-            return False
+        self._cache: dict[str, str] = {}
 
     # -------------------- Process Handling --------------------
 
@@ -34,20 +21,9 @@ class StreamPlayer:
             return
 
         try:
-            if self.system == "windows":
-                subprocess.run(
-                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-            else:
-                try:
-                    os.killpg(os.getpgid(process.pid), 15)  # SIGTERM
-                    time.sleep(0.2)
-                    os.killpg(os.getpgid(process.pid), 9)   # SIGKILL fallback
-                except Exception:
-                    process.terminate()
+            os.killpg(os.getpgid(process.pid), 15)  # SIGTERM
+            time.sleep(0.2)
+            os.killpg(os.getpgid(process.pid), 9)   # SIGKILL fallback
         except Exception:
             try:
                 process.terminate()
@@ -64,12 +40,21 @@ class StreamPlayer:
         if url in self._cache:
             return self._cache[url]
 
-        if self.system == "windows":
-            cmd = [sys.executable, "-m", "yt_dlp", "-g", "-f", "bestaudio", "--no-playlist", url]
-        else:
-            cmd = ["yt-dlp", "-g", "-f", "bestaudio", "--no-playlist", url]
+        cmd = [
+            "yt-dlp",
+            "-g",
+            "-f",
+            "bestaudio",
+            "--no-playlist",
+            url,
+        ]
 
-        resolved = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        resolved = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
         if resolved.returncode != 0:
             details = (resolved.stderr or resolved.stdout or "").strip()
@@ -91,38 +76,26 @@ class StreamPlayer:
     def start(self, url: str, *, volume: int = 100) -> None:
         """Start playback (non-blocking)."""
         self.stop()
-        stream_url = self._resolve_audio_url(url)
 
+        stream_url = self._resolve_audio_url(url)
         vol = max(0, min(100, int(volume)))
 
         player_cmd = [
             "ffplay",
-            "-vn",               # disable video
+            "-vn",
             "-nodisp",
             "-autoexit",
             "-loglevel", "error",
+            "-volume", str(vol),
+            stream_url,
         ]
 
-        # Force ALSA on Raspberry Pi
-        if self.is_pi:
-            player_cmd += ["-f", "alsa", "-ac", "2"]
-
-        player_cmd += ["-volume", str(vol), stream_url]
-
-        if self.system == "windows":
-            self.player_process = subprocess.Popen(
-                player_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-        else:
-            self.player_process = subprocess.Popen(
-                player_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid,
-            )
+        self.player_process = subprocess.Popen(
+            player_cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid,  # Linux process group
+        )
 
     def play(self, url: str, *, duration: Optional[int] = None):
         """Blocking play."""
@@ -139,19 +112,31 @@ class StreamPlayer:
 
 # -------------------- Duration Utility --------------------
 
-def get_media_duration_seconds(url: str, *, timeout: int = 45) -> Optional[int]:
+def get_media_duration_seconds(
+    url: str,
+    *,
+    timeout: int = 45
+) -> Optional[int]:
     """Return media duration in seconds using yt-dlp JSON, or None if unknown/live."""
 
     if not url:
         return None
 
-    if platform.system().lower() == "windows":
-        cmd = [sys.executable, "-m", "yt_dlp", "-J", "--no-playlist", url]
-    else:
-        cmd = ["yt-dlp", "-J", "--no-playlist", url]
+    cmd = [
+        "yt-dlp",
+        "-J",
+        "--no-playlist",
+        url,
+    ]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
     except Exception:
         return None
 
