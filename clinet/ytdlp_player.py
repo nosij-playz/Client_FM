@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+
 import json
 import os
 import subprocess
 import time
+import platform
+import signal
 from typing import Optional
 
 
@@ -16,14 +19,22 @@ class StreamPlayer:
 
     # -------------------- Process Handling --------------------
 
+
     def _kill_process_tree(self, process: Optional[subprocess.Popen]):
         if not process or process.poll() is not None:
             return
 
         try:
-            os.killpg(os.getpgid(process.pid), 15)  # SIGTERM
-            time.sleep(0.2)
-            os.killpg(os.getpgid(process.pid), 9)   # SIGKILL fallback
+            if os.name == "nt":
+                # Windows: send CTRL_BREAK_EVENT to process group
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+                time.sleep(0.2)
+                process.terminate()
+            else:
+                # Linux/Unix: use killpg
+                os.killpg(os.getpgid(process.pid), 15)  # SIGTERM
+                time.sleep(0.2)
+                os.killpg(os.getpgid(process.pid), 9)   # SIGKILL fallback
         except Exception:
             try:
                 process.terminate()
@@ -73,8 +84,9 @@ class StreamPlayer:
     def is_playing(self) -> bool:
         return bool(self.player_process and self.player_process.poll() is None)
 
-    def start(self, url: str, *, volume: int = 100) -> None:
-        """Start playback (non-blocking)."""
+
+    def start(self, url: str, *, volume: int = 100, position: float = 0.0) -> None:
+        """Start playback (non-blocking). Optionally start from a given position (seconds)."""
         self.stop()
 
         stream_url = self._resolve_audio_url(url)
@@ -87,15 +99,27 @@ class StreamPlayer:
             "-autoexit",
             "-loglevel", "error",
             "-volume", str(vol),
-            stream_url,
         ]
+        if position > 0:
+            player_cmd.extend(["-ss", str(float(position))])
+        player_cmd.append(stream_url)
 
-        self.player_process = subprocess.Popen(
-            player_cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid,  # Linux process group
-        )
+        if os.name == "nt":
+            # Windows: use CREATE_NEW_PROCESS_GROUP
+            self.player_process = subprocess.Popen(
+                player_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            # Linux/Unix: use preexec_fn=os.setsid
+            self.player_process = subprocess.Popen(
+                player_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,  # Linux process group
+            )
 
     def play(self, url: str, *, duration: Optional[int] = None):
         """Blocking play."""

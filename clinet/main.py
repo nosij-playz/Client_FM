@@ -12,6 +12,42 @@ from .ytdlp_player import StreamPlayer, get_media_duration_seconds
 
 
 class FMClient:
+    def start_client_state_reset_monitor(self, state_path=None, poll_interval=1.0, reset_delay=5.0):
+        import threading, json, time, os
+        if state_path is None:
+            state_path = os.path.join(os.path.dirname(__file__), '..', 'client_state.json')
+        state_path = os.path.abspath(state_path)
+        last_seen = {"last_ai_alert_id": 0, "last_user_alert_id": 0}
+        change_times = {"last_ai_alert_id": None, "last_user_alert_id": None}
+        def monitor():
+            while True:
+                try:
+                    with open(state_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    changed = False
+                    now = time.time()
+                    for key in ("last_ai_alert_id", "last_user_alert_id"):
+                        val = data.get(key, 0)
+                        if val != last_seen[key]:
+                            if val != 0:
+                                change_times[key] = now
+                            else:
+                                change_times[key] = None
+                            last_seen[key] = val
+                        # If changed to nonzero and 5s passed, reset to 0
+                        if val != 0 and change_times[key] is not None and now - change_times[key] >= reset_delay:
+                            data[key] = 0
+                            last_seen[key] = 0
+                            change_times[key] = None
+                            changed = True
+                    if changed:
+                        with open(state_path, 'w', encoding='utf-8') as f:
+                            json.dump(data, f, indent=2)
+                except Exception as e:
+                    print(f"[client_state reset monitor] Error: {e}")
+                time.sleep(poll_interval)
+        t = threading.Thread(target=monitor, daemon=True)
+        t.start()
     def __init__(
         self,
         mysql_host,
@@ -75,10 +111,12 @@ class FMClient:
         self.music_volume_ducked = 10
 
         # TTS loudness (played via ffplay with an audio filter gain).
-        self.tts_gain_user = 1.0
+        self.tts_gain_user = 4.0
         self.tts_gain_ai = 4.0
 
         self._validate_state()
+        # Start background monitor to reset client_state.json alert ids after 5s
+        self.start_client_state_reset_monitor(state_path=self.state_path)
 
     # ---------------------------
     # Music watcher (DB -> player sync)
@@ -178,6 +216,32 @@ class FMClient:
     # ---------------------------
     # TTS
     # ---------------------------
+    def start_client_state_monitor(self, state_path=None, poll_interval=1.0):
+        import threading, json, time, os
+        if state_path is None:
+            state_path = os.path.join(os.path.dirname(__file__), '..', 'client_state.json')
+        state_path = os.path.abspath(state_path)
+        def monitor():
+            last_seen = {"last_ai_alert_id": None, "last_user_alert_id": None}
+            while True:
+                try:
+                    with open(state_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    changed = False
+                    for key in ("last_ai_alert_id", "last_user_alert_id"):
+                        val = data.get(key, 0)
+                        if last_seen[key] is not None and last_seen[key] == 0 and val != 0:
+                            data[key] = 0
+                            changed = True
+                        last_seen[key] = data.get(key, 0)
+                    if changed:
+                        with open(state_path, 'w', encoding='utf-8') as f:
+                            json.dump(data, f, indent=2)
+                except Exception as e:
+                    print(f"[client_state monitor] Error: {e}")
+                time.sleep(poll_interval)
+        t = threading.Thread(target=monitor, daemon=True)
+        t.start()
     @staticmethod
     def _play_audio_file_ffplay(file_path: str, *, volume: int = 100, gain: float = 1.0) -> None:
         vol = int(volume)
@@ -197,11 +261,16 @@ class FMClient:
         ]
         if gain and float(gain) != 1.0:
             cmd.extend(["-af", f"volume={float(gain)}"])
+        import os
         cmd.append(str(file_path))
+
+        if not os.path.isfile(file_path):
+            raise FileNotFoundError(f"Audio file not found: {file_path}")
 
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if proc.returncode != 0:
             details = (proc.stderr or proc.stdout or "").strip()
+            print(f"❌ ffplay failed to play audio: {details}")
             raise RuntimeError(f"ffplay failed to play audio: {details}" if details else "ffplay failed to play audio")
 
     @staticmethod
@@ -224,6 +293,7 @@ class FMClient:
         )
 
     def speak_message(self, msg: str, *, gain: float = 1.0) -> int:
+        import os
         if not self.is_audio_allowed():
             self._print_status_mode_once()
             return 0
@@ -243,23 +313,32 @@ class FMClient:
                 lang = detect_language(part)
                 audio = generate_voice_from_text(part, lang=lang)
             except Exception as e:
-                # Skip parts that are not speakable / fail TTS generation.
                 print(f"❌ TTS generation failed for a message part: {e}")
                 continue
 
+            audio_file = audio.get("file")
             print(
                 f"🔊 Speaking ({audio.get('lang')}) via {audio.get('engine')} "
-                f"voice={audio.get('voice')} rate={audio.get('rate')}"
+                f"voice={audio.get('voice', 'N/A')} rate={audio.get('rate', 'N/A')} file={audio_file}"
             )
 
-            try:
-                self._play_audio_file_ffplay(audio["file"], volume=100, gain=float(gain))
-            except FileNotFoundError:
-                # Fallback if ffplay isn't installed.
-                from playsound import playsound
+            if not audio_file or not os.path.isfile(audio_file):
+                print(f"❌ TTS audio file does not exist: {audio_file}")
+                continue
 
-                playsound(audio["file"])
-            spoken += 1
+            try:
+                self._play_audio_file_ffplay(audio_file, volume=100, gain=float(gain))
+            except FileNotFoundError:
+                print(f"❌ ffplay not found, falling back to playsound for {audio_file}")
+                try:
+                    from playsound import playsound
+                    playsound(audio_file)
+                except Exception as e2:
+                    print(f"❌ playsound failed: {e2}")
+            except Exception as e:
+                print(f"❌ Exception during TTS playback: {e}")
+            else:
+                spoken += 1
 
         return spoken
 
@@ -363,9 +442,10 @@ class FMClient:
     # Alert handling
     # ---------------------------
     def handle_user_alerts(self):
-        user_alert = self.db.get_next_user_alert_after(self.state.last_user_alert_id)
-        if user_alert and user_alert.id > 0:
-            print(f"📥 User alert (id={user_alert.id})")
+        # Always check for user alert at id=1
+        user_alert = self.db.get_next_user_alert_after(0)
+        if user_alert and user_alert.id == 1 and user_alert.message and user_alert.message.strip():
+            print(f"📥 User alert (id=1)")
             try:
                 self.speak_message(user_alert.message, gain=self.tts_gain_user)
             except Exception as e:
@@ -373,12 +453,27 @@ class FMClient:
             else:
                 removed = self.db.ack_user_alert(user_alert.id)
                 if not removed:
-                    print(f"⚠️  Could not remove user alert from DB (id={user_alert.id})")
-                self.state.last_user_alert_id = max(
-                    self.state.last_user_alert_id, user_alert.id
-                )
-                save_state(self.state_path, self.state)
-                return True
+                    print(f"⚠️  Could not remove user alert from DB (id=1)")
+            return True
+        # Always check for AI alert at id=1
+        ai_alert = self.db.get_next_ai_alert_after(0)
+        if ai_alert and ai_alert.id == 1 and ai_alert.message and ai_alert.message.strip():
+            print(f"🚨 AI alert (id=1, severity={ai_alert.severity})")
+            try:
+                spoken = self.speak_message(ai_alert.message, gain=self.tts_gain_ai)
+                if spoken <= 0:
+                    raise ValueError("AI alert has no speakable text")
+            except Exception as e:
+                print(f"❌ Failed to speak AI alert: {e}")
+                if (not self._has_speakable_text(ai_alert.message)) or self._should_ack_failed_tts(e):
+                    removed = self.db.ack_ai_alert(ai_alert.id)
+                    if not removed:
+                        print(f"⚠️  Could not remove AI alert from DB (id=1)")
+            else:
+                removed = self.db.ack_ai_alert(ai_alert.id)
+                if not removed:
+                    print(f"⚠️  Could not remove AI alert from DB (id=1)")
+            return True
         return False
 
     def handle_ai_alerts(self):
@@ -440,9 +535,15 @@ class FMClient:
         print(f"🔗 {music.link}")
         print(f"⏳ Duration: {duration}s" if duration is not None else "⏳ Duration: (continuous)")
 
-        self.player.start(music.link, volume=self.music_volume_normal)
-
-        started_at = time.time()
+        resume_position = 0.0
+        # Only start player if not already playing this music
+        if not hasattr(self, '_current_music') or not self._same_music(self._current_music, music):
+            self.player.start(music.link, volume=self.music_volume_normal, position=resume_position)
+            self._current_music = music
+            started_at = time.time()
+        else:
+            # Continue from current position
+            started_at = time.time() - resume_position
         planned = int(duration) if duration is not None else None
 
         while True:
@@ -464,22 +565,25 @@ class FMClient:
                 print(f"🎶 Playing music (id={music.id}) {music.name}")
                 print(f"🔗 {music.link}")
                 print(f"⏳ Duration: {duration}s" if duration is not None else "⏳ Duration: (continuous)")
-                self.player.start(music.link, volume=self.music_volume_normal)
+                resume_position = 0.0
+                self.player.start(music.link, volume=self.music_volume_normal, position=resume_position)
+                self._current_music = music
                 started_at = time.time()
                 planned = int(duration) if duration is not None else None
 
-            elapsed = time.time() - started_at
+            elapsed = time.time() - started_at + resume_position
             if planned is not None and elapsed >= planned:
                 self.player.stop()
                 break
 
             # Interrupt for user alerts
-            user_alert = self.db.get_next_user_alert_after(
-                self.state.last_user_alert_id
-            )
-            if user_alert and user_alert.id > 0:
-                print(f"📥 User alert (id={user_alert.id})")
+            # Always check for user alert at id=1
+            user_alert = self.db.get_next_user_alert_after(0)
+            if user_alert and user_alert.id == 1 and user_alert.message and user_alert.message.strip():
+                print(f"📥 User alert (id=1)")
                 self.player.stop()
+                # Calculate resume position
+                resume_position = time.time() - started_at + resume_position
 
                 try:
                     self.speak_message(user_alert.message, gain=self.tts_gain_user)
@@ -488,14 +592,34 @@ class FMClient:
                 else:
                     removed = self.db.ack_user_alert(user_alert.id)
                     if not removed:
-                        print(f"⚠️  Could not remove user alert from DB (id={user_alert.id})")
-                    self.state.last_user_alert_id = max(
-                        self.state.last_user_alert_id, user_alert.id
-                    )
-                    save_state(self.state_path, self.state)
+                        print(f"⚠️  Could not remove user alert from DB (id=1)")
 
-                # Restart music
-                self.player.start(music.link, volume=self.music_volume_normal)
+                # Resume music from last position (after alert)
+                self.player.start(music.link, volume=self.music_volume_normal, position=resume_position)
+                started_at = time.time()
+
+            # Always check for AI alert at id=1
+            ai_alert = self.db.get_next_ai_alert_after(0)
+            if ai_alert and ai_alert.id == 1 and ai_alert.message and ai_alert.message.strip():
+                print(f"🚨 AI alert (id=1, severity={ai_alert.severity})")
+                self.player.start(music.link, volume=self.music_volume_ducked, position=resume_position)
+                try:
+                    spoken = self.speak_message(ai_alert.message, gain=self.tts_gain_ai)
+                    if spoken <= 0:
+                        raise ValueError("AI alert has no speakable text")
+                except Exception as e:
+                    print(f"❌ Failed to speak AI alert: {e}")
+                    if (not self._has_speakable_text(ai_alert.message)) or self._should_ack_failed_tts(e):
+                        removed = self.db.ack_ai_alert(ai_alert.id)
+                        if not removed:
+                            print(f"⚠️  Could not remove AI alert from DB (id=1)")
+                else:
+                    removed = self.db.ack_ai_alert(ai_alert.id)
+                    if not removed:
+                        print(f"⚠️  Could not remove AI alert from DB (id=1)")
+                finally:
+                    # Restore normal music volume (best-effort)
+                    self.player.start(music.link, volume=self.music_volume_normal, position=resume_position)
                 started_at = time.time()
 
             # Duck music for AI alerts (do not pause)
@@ -504,7 +628,7 @@ class FMClient:
                 print(f"🚨 AI alert (id={ai_alert.id}, severity={ai_alert.severity})")
 
                 # Reduce volume (best-effort: restart ffplay with lower volume)
-                self.player.start(music.link, volume=self.music_volume_ducked)
+                self.player.start(music.link, volume=self.music_volume_ducked, position=resume_position)
                 try:
                     spoken = self.speak_message(ai_alert.message, gain=self.tts_gain_ai)
                     if spoken <= 0:
@@ -525,7 +649,7 @@ class FMClient:
                     save_state(self.state_path, self.state)
                 finally:
                     # Restore normal music volume (best-effort)
-                    self.player.start(music.link, volume=self.music_volume_normal)
+                    self.player.start(music.link, volume=self.music_volume_normal, position=resume_position)
 
             time.sleep(0.5)
 

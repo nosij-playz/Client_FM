@@ -37,16 +37,24 @@ class MySQLRadioDB:
         self.config = config
 
     def _conn(self):
-        return mysql.connector.connect(
-            host=self.config.host,
-            port=self.config.port,
-            user=self.config.user,
-            password=self.config.password,
-            database=self.config.database,
-            connection_timeout=self.config.connection_timeout,
-            use_unicode=True,
-            charset="utf8mb4",
-        )
+        try:
+            return mysql.connector.connect(
+                host=self.config.host,
+                port=self.config.port,
+                user=self.config.user,
+                password=self.config.password,
+                database=self.config.database,
+                connection_timeout=self.config.connection_timeout,
+                use_unicode=True,
+                charset="utf8mb4",
+            )
+        except MySQLError as e:
+            print("❌ MySQL connection failed!")
+            print(f"  Host: {self.config.host}:{self.config.port}")
+            print(f"  User: {self.config.user}")
+            print(f"  Database: {self.config.database}")
+            print(f"  Error: {e}")
+            raise
 
     def get_next_music_after(self, last_id: int) -> Optional[MusicRow]:
         conn = self._conn()
