@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-
 import json
 import os
 import subprocess
 import time
 import platform
 import signal
+import sys
 from typing import Optional
+
+
+# Always use python -m yt_dlp (never call yt-dlp directly)
+YT_DLP = [sys.executable, "-m", "yt_dlp"]
 
 
 class StreamPlayer:
@@ -19,22 +23,19 @@ class StreamPlayer:
 
     # -------------------- Process Handling --------------------
 
-
     def _kill_process_tree(self, process: Optional[subprocess.Popen]):
         if not process or process.poll() is not None:
             return
 
         try:
             if os.name == "nt":
-                # Windows: send CTRL_BREAK_EVENT to process group
                 process.send_signal(signal.CTRL_BREAK_EVENT)
                 time.sleep(0.2)
                 process.terminate()
             else:
-                # Linux/Unix: use killpg
-                os.killpg(os.getpgid(process.pid), 15)  # SIGTERM
+                os.killpg(os.getpgid(process.pid), 15)
                 time.sleep(0.2)
-                os.killpg(os.getpgid(process.pid), 9)   # SIGKILL fallback
+                os.killpg(os.getpgid(process.pid), 9)
         except Exception:
             try:
                 process.terminate()
@@ -51,8 +52,7 @@ class StreamPlayer:
         if url in self._cache:
             return self._cache[url]
 
-        cmd = [
-            "yt-dlp",
+        cmd = YT_DLP + [
             "-g",
             "-f",
             "bestaudio",
@@ -84,9 +84,7 @@ class StreamPlayer:
     def is_playing(self) -> bool:
         return bool(self.player_process and self.player_process.poll() is None)
 
-
     def start(self, url: str, *, volume: int = 100, position: float = 0.0) -> None:
-        """Start playback (non-blocking). Optionally start from a given position (seconds)."""
         self.stop()
 
         stream_url = self._resolve_audio_url(url)
@@ -105,7 +103,6 @@ class StreamPlayer:
         player_cmd.append(stream_url)
 
         if os.name == "nt":
-            # Windows: use CREATE_NEW_PROCESS_GROUP
             self.player_process = subprocess.Popen(
                 player_cmd,
                 stdout=subprocess.DEVNULL,
@@ -113,16 +110,14 @@ class StreamPlayer:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
             )
         else:
-            # Linux/Unix: use preexec_fn=os.setsid
             self.player_process = subprocess.Popen(
                 player_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid,  # Linux process group
+                preexec_fn=os.setsid,
             )
 
     def play(self, url: str, *, duration: Optional[int] = None):
-        """Blocking play."""
         self.start(url)
 
         if duration is not None:
@@ -136,18 +131,11 @@ class StreamPlayer:
 
 # -------------------- Duration Utility --------------------
 
-def get_media_duration_seconds(
-    url: str,
-    *,
-    timeout: int = 45
-) -> Optional[int]:
-    """Return media duration in seconds using yt-dlp JSON, or None if unknown/live."""
-
+def get_media_duration_seconds(url: str, *, timeout: int = 45) -> Optional[int]:
     if not url:
         return None
 
-    cmd = [
-        "yt-dlp",
+    cmd = YT_DLP + [
         "-J",
         "--no-playlist",
         url,
